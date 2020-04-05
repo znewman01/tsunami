@@ -241,7 +241,7 @@ pub struct Launcher<P = DefaultCredentialsProvider> {
     max_instance_duration_hours: usize,
     use_open_ports: bool,
     regions: HashMap<<Setup as super::MachineSetup>::Region, RegionLauncher>,
-    rt: Option<tokio::runtime::Runtime>,
+    rt: Option<tokio::runtime::Handle>,
 }
 
 impl Default for Launcher {
@@ -313,12 +313,22 @@ impl<P> Drop for Launcher<P> {
         //    never get to this point.
         // 3. A no-op happened (launch() was not called at all). Again, regions.is_empty() will be
         //    true since regions can only be populated in launch().
-        let rt = self.rt.as_mut().expect("Launch tokio runtime");
-        rt.block_on(futures_util::future::join_all(
-            self.regions
-                .drain()
-                .map(|(_, mut rl)| async move { rl.shutdown().await }),
-        ));
+        if let Self {
+            rt: Some(ref mut rt),
+            ref mut regions,
+            ..
+        } = self
+        {
+            rt.enter(move || {
+                futures::executor::block_on(futures::future::join_all(
+                    regions
+                        .drain()
+                        .map(|(_, mut rl)| async move { rl.shutdown().await }),
+                ));
+            });
+        } else {
+            unreachable!()
+        }
     }
 }
 
@@ -330,14 +340,17 @@ where
 
     fn launch(&mut self, l: super::LaunchDescriptor<Self::MachineDescriptor>) -> Result<(), Error> {
         let prov = (*self.credential_provider)()?;
-        if let None = self.rt {
-            self.rt = Some(
-                tokio::runtime::Builder::new()
+        if self.rt.is_none() {
+            self.rt = Some(match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(_) => tokio::runtime::Builder::new()
                     .basic_scheduler()
                     .enable_all()
                     .build()
-                    .expect("Make a tokio runtime"),
-            );
+                    .expect("Make a tokio runtime")
+                    .handle()
+                    .clone(),
+            });
         }
 
         if let Self {
@@ -348,15 +361,17 @@ where
             ..
         } = self
         {
-            rt.block_on(async {
-                let mut awsregion =
-                    RegionLauncher::new(&l.region.to_string(), prov, *use_open_ports, l.log)
+            rt.enter(|| {
+                futures::executor::block_on(async {
+                    let mut awsregion =
+                        RegionLauncher::new(&l.region.to_string(), prov, *use_open_ports, l.log)
+                            .await?;
+                    awsregion
+                        .launch(*max_instance_duration_hours, l.max_wait, l.machines)
                         .await?;
-                awsregion
-                    .launch(*max_instance_duration_hours, l.max_wait, l.machines)
-                    .await?;
-                regions.insert(l.region, awsregion);
-                Ok(())
+                    regions.insert(l.region, awsregion);
+                    Ok(())
+                })
             })
         } else {
             unreachable!();
@@ -1017,59 +1032,54 @@ mod test {
     use rusoto_core::region::Region;
     use rusoto_ec2::Ec2;
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn make_key() -> Result<(), Error> {
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
+    async fn make_key() -> Result<(), Error> {
         let region = Region::UsEast1;
         let provider = DefaultCredentialsProvider::new()?;
         let ec2 = RegionLauncher::connect(region, provider, test_logger())?;
-        rt.block_on(async {
-            let mut ec2 = ec2.make_ssh_key().await?;
-            println!("==> key name: {}", ec2.ssh_key_name);
-            println!("==> key path: {:?}", ec2.private_key_path);
-            assert!(!ec2.ssh_key_name.is_empty());
-            assert!(ec2.private_key_path.as_ref().unwrap().path().exists());
 
-            let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
-            req.key_name = ec2.ssh_key_name.clone();
-            ec2.client
-                .as_mut()
-                .unwrap()
-                .delete_key_pair(req)
-                .await
-                .context(format!(
-                    "Could not delete ssh key pair {:?}",
-                    ec2.ssh_key_name
-                ))?;
+        let mut ec2 = ec2.make_ssh_key().await?;
+        println!("==> key name: {}", ec2.ssh_key_name);
+        println!("==> key path: {:?}", ec2.private_key_path);
+        assert!(!ec2.ssh_key_name.is_empty());
+        assert!(ec2.private_key_path.as_ref().unwrap().path().exists());
 
-            Ok(())
-        })
+        let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
+        req.key_name = ec2.ssh_key_name.clone();
+        ec2.client
+            .as_mut()
+            .unwrap()
+            .delete_key_pair(req)
+            .await
+            .context(format!(
+                "Could not delete ssh key pair {:?}",
+                ec2.ssh_key_name
+            ))?;
+
+        Ok(())
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn multi_instance_spot_request() -> Result<(), Error> {
+    async fn multi_instance_spot_request() -> Result<(), Error> {
         let region = "us-east-1";
         let provider = DefaultCredentialsProvider::new()?;
         let logger = test_logger();
 
-        let mut rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let mut ec2 = RegionLauncher::new(region, provider, false, logger.clone()).await?;
+        let mut ec2 = RegionLauncher::new(region, provider, false, logger.clone()).await?;
 
-            use super::Setup;
+        use super::Setup;
 
-            let names = (1..).map(|x| format!("{}", x));
-            let setup = Setup::default();
-            let ms: Vec<(String, Setup)> = names.zip(itertools::repeat_n(setup, 5)).collect();
+        let names = (1..).map(|x| format!("{}", x));
+        let setup = Setup::default();
+        let ms: Vec<(String, Setup)> = names.zip(itertools::repeat_n(setup, 5)).collect();
 
-            debug!(&logger, "make spot instance requests"; "num" => ms.len());
-            ec2.make_spot_instance_requests(60, ms).await?;
-            assert_eq!(ec2.outstanding_spot_request_ids.len(), 5);
-            debug!(&logger, "wait for spot instance requests");
-            ec2.wait_for_spot_instance_requests(None).await?;
-            Ok(())
-        })
+        debug!(&logger, "make spot instance requests"; "num" => ms.len());
+        ec2.make_spot_instance_requests(60, ms).await?;
+        assert_eq!(ec2.outstanding_spot_request_ids.len(), 5);
+        debug!(&logger, "wait for spot instance requests");
+        ec2.wait_for_spot_instance_requests(None).await?;
+        Ok(())
     }
 }
