@@ -511,6 +511,16 @@ impl RegionLauncher {
         let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
         req.group_id = Some(group_id.clone());
 
+        // ssh access
+        req.ip_protocol = Some("tcp".to_string());
+        req.from_port = Some(22);
+        req.to_port = Some(22);
+        req.cidr_ip = Some("0.0.0.0/0".to_string());
+        trace!(log, "adding ssh access to security group");
+        ec2.authorize_security_group_ingress(req.clone())
+            .await
+            .context("failed to fill in security group for new machines")?;
+
         // icmp access
         req.ip_protocol = Some("icmp".to_string());
         req.from_port = Some(-1);
