@@ -995,6 +995,566 @@ impl RegionLauncher {
     }
 }
 
+/// AWS EC2 instance launcher
+#[derive(Educe)]
+#[educe(Debug)]
+pub struct OnDemandLauncher<P = DefaultCredentialsProvider> {
+    #[educe(Debug(ignore))]
+    credential_provider: Box<dyn Fn() -> Result<P, Error>>,
+    max_instance_duration_hours: usize,
+    use_open_ports: bool,
+    regions: HashMap<<Setup as super::MachineSetup>::Region, OnDemandRegionLauncher>,
+    rt: Option<tokio::runtime::Handle>,
+}
+
+impl Default for OnDemandLauncher {
+    fn default() -> Self {
+        OnDemandLauncher {
+            credential_provider: Box::new(|| Ok(DefaultCredentialsProvider::new()?)),
+            max_instance_duration_hours: 6,
+            use_open_ports: false,
+            regions: Default::default(),
+            rt: Default::default(),
+        }
+    }
+}
+
+impl<P> OnDemandLauncher<P> {
+    /// The machines spawned on this launcher will have
+    /// ports open to the public Internet.
+    pub fn open_ports(&mut self) -> &mut Self {
+        self.use_open_ports = true;
+        self
+    }
+
+    /// Set the credential provider used to authenticate to EC2.
+    ///
+    /// The provided function is called once for each region, and is expected to produce a
+    /// [`P: ProvideAwsCredentials`](https://docs.rs/rusoto_core/0.40.0/rusoto_core/trait.ProvideAwsCredentials.html)
+    /// that gives access to the region in question.
+    pub fn with_credentials<P2>(
+        mut self,
+        f: impl Fn() -> Result<P2, Error> + 'static,
+    ) -> OnDemandLauncher<P2> {
+        // Launcher impls Drop, so can't move out of it.
+        let regions = self.regions.drain().collect();
+        OnDemandLauncher {
+            credential_provider: Box::new(f),
+            max_instance_duration_hours: self.max_instance_duration_hours,
+            use_open_ports: self.use_open_ports,
+            regions,
+            rt: self.rt.take(),
+        }
+    }
+}
+
+impl<P> Drop for OnDemandLauncher<P> {
+    fn drop(&mut self) {
+        if self.regions.is_empty() {
+            return;
+        }
+
+        // This is ok because there are three ways to get to this method.
+        // 1. launch() was called, and there are regions to shut down. In this case, launch() made
+        //    a new Runtime, which we can now use.
+        // 2. with_credentials() was called, and this is the old, discarded Self being dropped. In
+        //    that case, regions.drain() happened, the above regions.is_empty() check ensures we
+        //    never get to this point.
+        // 3. A no-op happened (launch() was not called at all). Again, regions.is_empty() will be
+        //    true since regions can only be populated in launch().
+        if let Self {
+            rt: Some(ref mut rt),
+            ref mut regions,
+            ..
+        } = self
+        {
+            rt.enter(move || {
+                futures::executor::block_on(futures::future::join_all(
+                    regions
+                        .drain()
+                        .map(|(_, mut rl)| async move { rl.shutdown().await }),
+                ));
+            });
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+impl<P> super::Launcher for OnDemandLauncher<P>
+where
+    P: ProvideAwsCredentials + Send + Sync + 'static,
+{
+    type MachineDescriptor = Setup;
+
+    fn launch(&mut self, l: super::LaunchDescriptor<Self::MachineDescriptor>) -> Result<(), Error> {
+        let prov = (*self.credential_provider)()?;
+        if self.rt.is_none() {
+            self.rt = Some(match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(_) => tokio::runtime::Builder::new()
+                    .basic_scheduler()
+                    .enable_all()
+                    .build()
+                    .expect("Make a tokio runtime")
+                    .handle()
+                    .clone(),
+            });
+        }
+
+        if let Self {
+            rt: Some(ref mut rt),
+            use_open_ports,
+            ref mut regions,
+            ..
+        } = self
+        {
+            rt.enter(|| {
+                futures::executor::block_on(async {
+                    let mut awsregion = OnDemandRegionLauncher::new(
+                        &l.region.to_string(),
+                        prov,
+                        *use_open_ports,
+                        l.log,
+                    )
+                    .await?;
+                    awsregion.launch(l.max_wait, l.machines).await?;
+                    regions.insert(l.region, awsregion);
+                    Ok(())
+                })
+            })
+        } else {
+            unreachable!();
+        }
+    }
+
+    fn connect_all<'l>(&'l self) -> Result<HashMap<String, crate::Machine<'l>>, Error> {
+        collect!(self.regions)
+    }
+}
+
+/// Region specific. Launch AWS EC2 on-demand instances.
+///
+/// This implementation uses [rusoto](https://crates.io/crates/rusoto_core) to connect to AWS.
+/// If this struct is dropped, the instances *will not* be terminated automatically, you must call
+/// [`RegionLauncher::shutdown`] to terminate the instances. If you prefer not to deal with this,
+/// use [`Launcher`] instead.
+#[derive(Educe, Default)]
+#[educe(Debug)]
+pub struct OnDemandRegionLauncher {
+    /// The region this RegionLauncher is connected to.
+    pub region: rusoto_core::region::Region,
+    security_group_id: String,
+    ssh_key_name: String,
+    private_key_path: Option<tempfile::NamedTempFile>,
+    #[educe(Debug(ignore))]
+    client: Option<rusoto_ec2::Ec2Client>,
+    instances: HashMap<String, (Option<(String, String)>, (String, Setup))>,
+    log: Option<slog::Logger>,
+}
+
+impl OnDemandRegionLauncher {
+    /// Connect to AWS region `region`, using credentials provider `provider`.
+    ///
+    /// This is a lower-level API, you may want [`Launcher`] instead.
+    ///
+    /// This will create a temporary security group and SSH key in the given AWS region.
+    pub async fn new<P>(
+        region: &str,
+        provider: P,
+        use_open_ports: bool,
+        log: slog::Logger,
+    ) -> Result<Self, Error>
+    where
+        P: ProvideAwsCredentials + Send + Sync + 'static,
+    {
+        let region = region.parse()?;
+        let ec2 = OnDemandRegionLauncher::connect(region, provider, log)?
+            .make_security_group(use_open_ports)
+            .await?
+            .make_ssh_key()
+            .await?;
+
+        Ok(ec2)
+    }
+
+    fn connect<P>(
+        region: rusoto_core::region::Region,
+        provider: P,
+        log: slog::Logger,
+    ) -> Result<Self, Error>
+    where
+        P: ProvideAwsCredentials + Send + Sync + 'static,
+    {
+        debug!(log, "connecting to ec2");
+        let ec2 = rusoto_ec2::Ec2Client::new_with(HttpClient::new()?, provider, region.clone());
+
+        Ok(Self {
+            region,
+            security_group_id: Default::default(),
+            ssh_key_name: Default::default(),
+            private_key_path: Some(
+                tempfile::NamedTempFile::new()
+                    .context("failed to create temporary file for keypair")?,
+            ),
+            instances: Default::default(),
+            client: Some(ec2),
+            log: Some(log),
+        })
+    }
+
+    /// Region-specific instance setup.
+    ///
+    /// Make spot instance requests, wait for the instances, and then call the
+    /// instance setup functions.
+    pub async fn launch(
+        &mut self,
+        max_wait: Option<time::Duration>,
+        machines: impl IntoIterator<Item = (String, Setup)>,
+    ) -> Result<(), Error> {
+        self.make_instance_requests(machines).await?;
+        self.wait_for_instances(max_wait).await?;
+        Ok(())
+    }
+
+    async fn make_security_group(mut self, use_open_ports: bool) -> Result<Self, Error> {
+        let log = self.log.as_ref().expect("RegionLauncher uninitialized");
+        let ec2 = self.client.as_mut().expect("RegionLauncher unconnected");
+
+        // set up network firewall for machines
+        let group_name = super::rand_name("security");
+        trace!(log, "creating security group"; "name" => &group_name);
+        let mut req = rusoto_ec2::CreateSecurityGroupRequest::default();
+        req.group_name = group_name;
+        req.description = "temporary access group for tsunami VMs".to_string();
+        let res = ec2
+            .create_security_group(req)
+            .await
+            .context("failed to create security group for new machines")?;
+        let group_id = res
+            .group_id
+            .expect("aws created security group with no group id");
+        trace!(log, "created security group"; "id" => &group_id);
+
+        let mut req = rusoto_ec2::AuthorizeSecurityGroupIngressRequest::default();
+        req.group_id = Some(group_id.clone());
+
+        // ssh access
+        req.ip_protocol = Some("tcp".to_string());
+        req.from_port = Some(22);
+        req.to_port = Some(22);
+        req.cidr_ip = Some("0.0.0.0/0".to_string());
+        trace!(log, "adding ssh access to security group");
+        ec2.authorize_security_group_ingress(req.clone())
+            .await
+            .context("failed to fill in security group for new machines")?;
+
+        // icmp access
+        req.ip_protocol = Some("icmp".to_string());
+        req.from_port = Some(-1);
+        req.to_port = Some(-1);
+        req.cidr_ip = Some("0.0.0.0/0".to_string());
+        trace!(log, "adding icmp access to security group");
+        ec2.authorize_security_group_ingress(req.clone())
+            .await
+            .context("failed to fill in security group for new machines")?;
+
+        // The default VPC uses IPs in range 172.31.0.0/16:
+        // https://docs.aws.amazon.com/vpc/latest/userguide/default-vpc.html
+        // TODO(might-be-nice) Support configurable rules for other VPCs
+        req.ip_protocol = Some("tcp".to_string());
+        req.from_port = Some(0);
+        req.to_port = Some(65535);
+        if use_open_ports {
+            req.cidr_ip = Some("0.0.0.0/0".to_string());
+        } else {
+            req.cidr_ip = Some("172.31.0.0/16".to_string());
+        }
+
+        trace!(log, "adding internal VM access to security group");
+        ec2.authorize_security_group_ingress(req.clone())
+            .await
+            .context("failed to fill in security group for new machines")?;
+
+        req.ip_protocol = Some("udp".to_string());
+        req.from_port = Some(0);
+        req.to_port = Some(65535);
+        if use_open_ports {
+            req.cidr_ip = Some("0.0.0.0/0".to_string());
+        } else {
+            req.cidr_ip = Some("172.31.0.0/16".to_string());
+        }
+
+        trace!(log, "adding internal VM access to security group");
+        ec2.authorize_security_group_ingress(req)
+            .await
+            .context("failed to fill in security group for new machines")?;
+
+        self.security_group_id = group_id;
+        Ok(self)
+    }
+
+    async fn make_ssh_key(mut self) -> Result<Self, Error> {
+        let log = self.log.as_ref().expect("RegionLauncher uninitialized");
+        let ec2 = self.client.as_mut().expect("RegionLauncher unconnected");
+        let private_key_path = self
+            .private_key_path
+            .as_mut()
+            .expect("RegionLauncher unconnected");
+
+        // construct keypair for ssh access
+        trace!(log, "creating keypair");
+        let mut req = rusoto_ec2::CreateKeyPairRequest::default();
+        let key_name = super::rand_name("key");
+        req.key_name = key_name.clone();
+        let res = ec2
+            .create_key_pair(req)
+            .await
+            .context("failed to generate new key pair")?;
+        trace!(log, "created keypair"; "fingerprint" => res.key_fingerprint);
+
+        // write keypair to disk
+        let private_key = res
+            .key_material
+            .expect("aws did not generate key material for new key");
+        private_key_path
+            .write_all(private_key.as_bytes())
+            .context("could not write private key to file")?;
+        debug!(log, "wrote keypair to file"; "filename" => private_key_path.path().display());
+
+        self.ssh_key_name = key_name;
+        Ok(self)
+    }
+
+    /// Make on-demand instance requests, which will automatically get terminated after
+    /// `max_duration` minutes.
+    async fn make_instance_requests(
+        &mut self,
+        machines: impl IntoIterator<Item = (String, Setup)>,
+    ) -> Result<(), Error> {
+        let log = self.log.as_ref().expect("RegionLauncher uninitialized");
+
+        // minimize the number of spot requests:
+        for (_, reqs) in machines
+            .into_iter()
+            .map(|(name, m)| {
+                // attach labels (ami name, instance type):
+                // the only fields that vary between tsunami spot instance requests
+                (
+                    (m.ami.as_ref().unwrap().clone(), m.instance_type.clone()),
+                    (name, m),
+                )
+            })
+            .into_group_map()
+        // group by the labels
+        {
+            let mut req = rusoto_ec2::RunInstancesRequest::default();
+            req.image_id = Some(reqs[0].1.ami.as_ref().unwrap().clone());
+            req.instance_type = Some(reqs[0].1.instance_type.clone());
+            req.key_name = Some(self.ssh_key_name.clone());
+            req.security_group_ids = Some(vec![self.security_group_id.clone()]);
+            req.min_count = reqs.len() as i64;
+            req.max_count = reqs.len() as i64;
+
+            // TODO: VPC
+
+            trace!(log, "issuing run instance request");
+            let res = self
+                .client
+                .as_mut()
+                .unwrap()
+                .run_instances(req)
+                .await
+                .context("failed to request on-demand instance")?;
+
+            // collect for length check below
+            let instances: Vec<String> = res
+                .instances
+                .expect("run_instances should always return instances")
+                .into_iter()
+                .filter_map(|instance| instance.instance_id)
+                .inspect(|instance| {
+                    // TODO: add more info if in parallel
+                    trace!(&log, "received instance {:?}", &instance);
+                })
+                .collect();
+
+            // zip_eq will panic if lengths not equal, so check beforehand
+            if instances.len() != reqs.len() {
+                bail!(
+                    "Got {} instances but expected {}",
+                    instances.len(),
+                    reqs.len()
+                )
+            }
+
+            for (instance, req) in instances.into_iter().zip_eq(reqs.into_iter()) {
+                self.instances.insert(instance, (None, req));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Poll AWS until `max_wait` (if not `None`) or the instances are ready to SSH to.
+    async fn wait_for_instances(&mut self, max_wait: Option<time::Duration>) -> Result<(), Error> {
+        let start = time::Instant::now();
+        let mut desc_req = rusoto_ec2::DescribeInstancesRequest::default();
+        let client = self.client.as_ref().unwrap();
+        let log = self.log.as_ref().unwrap();
+        let private_key_path = self.private_key_path.as_ref().unwrap();
+        let mut all_ready = self.instances.is_empty();
+        desc_req.instance_ids = Some(self.instances.keys().cloned().collect());
+        while !all_ready {
+            all_ready = true;
+
+            for reservation in client
+                .describe_instances(desc_req.clone())
+                .await
+                .context("failed to describe instances")?
+                .reservations
+                .unwrap_or_else(Vec::new)
+            {
+                for instance in reservation.instances.unwrap_or_else(Vec::new) {
+                    match instance {
+                        // https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceState.html
+                        // code 16 means "Running"
+                        rusoto_ec2::Instance {
+                            state: Some(rusoto_ec2::InstanceState { code: Some(16), .. }),
+                            instance_id: Some(instance_id),
+                            public_dns_name: Some(public_dns),
+                            public_ip_address: Some(public_ip),
+                            ..
+                        } => {
+                            debug!(log, "instance ready";
+                                "instance_id" => instance_id.clone(),
+                                "ip" => &public_ip,
+                            );
+
+                            let (ipinfo, _) = self.instances.get_mut(&instance_id).unwrap();
+                            *ipinfo = Some((public_ip.clone(), public_dns.clone()));
+                        }
+                        _ => {
+                            all_ready = false;
+                        }
+                    }
+                }
+            }
+
+            if let Some(to) = max_wait {
+                if time::Instant::now().duration_since(start) > to {
+                    bail!("timed out");
+                }
+            }
+        }
+
+        use rayon::prelude::*;
+        self.instances
+            .par_iter()
+            .try_for_each(|(_instance_id, (ipinfo, (name, m_setup)))| {
+                let (public_ip, _) = ipinfo.as_ref().unwrap();
+                if let Setup {
+                    username,
+                    setup: Some(f),
+                    ..
+                } = m_setup
+                {
+                    super::setup_machine(
+                        log,
+                        &name,
+                        &public_ip,
+                        &username,
+                        max_wait,
+                        Some(private_key_path.path()),
+                        f.as_ref(),
+                    )?;
+                }
+
+                Ok(())
+            })
+    }
+
+    /// Establish SSH connections to the machines. The `Ok` value is a `HashMap` associating the
+    /// friendly name for each `Setup` with the corresponding SSH connection.
+    pub fn connect_all<'l>(&'l self) -> Result<HashMap<String, crate::Machine<'l>>, Error> {
+        let log = self.log.as_ref().unwrap();
+        let private_key_path = self.private_key_path.as_ref().unwrap();
+        self.instances
+            .values()
+            .map(|info| match info {
+                (Some((public_ip, public_dns)), (name, Setup { username, .. })) => {
+                    let mut m = Machine {
+                        public_ip: public_ip.clone(),
+                        public_dns: public_dns.clone(),
+                        nickname: name.clone(),
+                        ssh: None,
+                        _tsunami: Default::default(),
+                    };
+
+                    m.connect_ssh(log, &username, Some(private_key_path.path()))?;
+                    Ok((name.clone(), m))
+                }
+                _ => bail!("Machines not initialized"),
+            })
+            .collect()
+    }
+
+    /// Terminate all running instances.
+    ///
+    /// Additionally deletes ephemeral keys and security groups. Note: it is a known issue that
+    /// security groups often will not be deleted, due to timing quirks in the AWS api.
+    pub async fn shutdown(&mut self) {
+        let client = self.client.as_ref().unwrap();
+        let log = self.log.as_ref().expect("RegionLauncher uninitialized");
+        // terminate instances
+        if !self.instances.is_empty() {
+            info!(log, "terminating instances");
+            let instances = self.instances.keys().cloned().collect();
+            self.instances.clear();
+            let mut termination_req = rusoto_ec2::TerminateInstancesRequest::default();
+            termination_req.instance_ids = instances;
+            while let Err(e) = client.terminate_instances(termination_req.clone()).await {
+                let msg = format!("{}", e);
+                if msg.contains("Pooled stream disconnected") || msg.contains("broken pipe") {
+                    trace!(log, "retrying instance termination");
+                    continue;
+                } else {
+                    warn!(log, "failed to terminate tsunami instances: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        debug!(log, "cleaning up temporary resources");
+        if !self.security_group_id.trim().is_empty() {
+            trace!(log, "cleaning up temporary security group"; "name" => self.security_group_id.clone());
+            // clean up security groups and keys
+            // TODO need a retry loop for the security group. Currently, this fails
+            // because AWS takes some time to allow the security group to be deleted.
+            let mut req = rusoto_ec2::DeleteSecurityGroupRequest::default();
+            req.group_id = Some(self.security_group_id.clone());
+            if let Err(e) = client.delete_security_group(req).await {
+                warn!(log, "failed to clean up temporary security group";
+                    "group_id" => &self.security_group_id,
+                    "error" => ?e,
+                )
+            }
+        }
+
+        if !self.ssh_key_name.trim().is_empty() {
+            trace!(log, "cleaning up temporary keypair"; "name" => self.ssh_key_name.clone());
+            let mut req = rusoto_ec2::DeleteKeyPairRequest::default();
+            req.key_name = self.ssh_key_name.clone();
+            if let Err(e) = client.delete_key_pair(req).await {
+                warn!(log, "failed to clean up temporary SSH key";
+                    "key_name" => &self.ssh_key_name,
+                    "error" => ?e,
+                )
+            }
+        }
+    }
+}
+
 struct UbuntuAmi(String);
 
 impl From<Region> for UbuntuAmi {
